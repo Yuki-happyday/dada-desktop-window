@@ -1,0 +1,9 @@
+{
+  "id": "dada-desktop-window",
+  "name": "Dada 桌面日程",
+  "version": "1.0.5",
+  "minAppVersion": "1.13.0",
+  "description": "Dada Todo List 的独立桌面扩展：日程、清单、日历、置顶与贴边隐藏。需要启用 Dada Todo List。",
+  "author": "Personal extension; task UI by Plover (MIT)",
+  "isDesktopOnly": true
+}

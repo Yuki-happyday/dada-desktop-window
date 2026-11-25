@@ -1,0 +1,302 @@
+import { ItemView, Plugin } from 'obsidian';
+import { createApp, reactive } from 'vue';
+import TasksApp from './views/TasksApp.vue';
+import { initTasksApi, ensureInboxFile } from './api/tasks.js';
+import { setColorScheme, setWeekStart, setTagColors } from './composables/tasks-logic.js';
+import { normalizeMenuViews, normalizeMenuHidden } from './composables/viewMenu.js';
+import { setupDevReload } from './dev/devReload.js';
+import { setupHoverPreview, teardownHoverPreview } from './hoverPreview.js';
+import { DadaTodoSettingTab } from './ui/settings.js';
+import { ReminderService } from './services/reminder.js';
+import { initI18n, t } from './i18n/index.js';
+import { tooltip } from './directives/tooltip.js';
+import { VueModal } from './ui/VueModal.js';
+import TaskEditorModal from './components/TaskEditorModal.vue';
+import 'line-awesome/dist/line-awesome/css/line-awesome.min.css';
+import './styles/tokens.css';
+import './styles/modals.css';
+import './styles/task-modal.css';
+import './styles/settings.css';
+
+// ============================================================================
+// Dada Todo · Obsidian 插件入口（任务模块来自 myLife-Plugin）
+// ----------------------------------------------------------------------------
+// 技术栈：Vue 3（createApp / unmount）。
+// 注意：本文件只允许 default 导出插件类（Obsidian 以 module.exports 取它）。
+//   插件实例同时挂到 app.config.globalProperties.plugin（TasksApp 等用 this.plugin）
+//   与 app.provide('plugin', this)（兼容 inject 写法），数据层走 saveData / api/tasks.js。
+// ============================================================================
+
+// 视图类型 / 命令 id 等标识符：免费版 manifest.id = dada-todo-list →
+// 沿用历史值 dada-todo-view / open-dada-todo（不破坏老用户）。
+
+/** 待办视图：Obsidian 侧栏面板，挂载 Vue 应用 */
+class DadaTodoView extends ItemView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.plugin = plugin;
+    this.vueApp = null;
+  }
+
+  // 视图类型 / 标题 / 图标：固定为免费版取值（manifest.id = dada-todo-list）。
+  // 直接读 plugin.manifest.id 而非 plugin.viewType：避免宿主在某些时序下构造视图时
+  // 插件实例尚未注入（this.plugin 为空）而读到 undefined.viewType 崩溃。
+  // && 短路保证 this.plugin / manifest 任意一层缺失时都有兜底，不会抛错。
+  getViewType() {
+    return 'dada-todo-view';
+  }
+  getDisplayText() {
+    return t('app.viewTitle');
+  }
+  getIcon() {
+    return 'check-square';
+  }
+
+  async onOpen() {
+    const root = this.contentEl.createDiv('dada-todo-root');
+    root.style.height = '100%';
+
+    this.vueApp = createApp(TasksApp);
+    // 自定义指令：v-tooltip 用 Obsidian 自带 setTooltip 实现悬浮提示
+    this.vueApp.directive('tooltip', tooltip);
+    // 插件实例挂为全局属性（TasksApp 用 this.plugin）并一并 provide（兼容 inject）
+    this.vueApp.config.globalProperties.plugin = this.plugin;
+    this.vueApp.provide('plugin', this.plugin);
+    // i18n 翻译函数：组件内可用 inject('t') 或模板 $t（均已响应式，切语言自动重渲）
+    this.vueApp.config.globalProperties.$t = t;
+    this.vueApp.provide('t', t);
+    // mount 返回根组件公共代理：供数据相关设置变更后触发面板重载
+    this.vueRoot = this.vueApp.mount(root);
+  }
+
+  async onClose() {
+    if (this.vueApp) {
+      this.vueApp.unmount();
+      this.vueApp = null;
+      this.vueRoot = null;
+    }
+    this.contentEl.empty();
+  }
+}
+
+export default class DadaTodoPlugin extends Plugin {
+  async onload() {
+    // 配置常驻内存（官方推荐模式：onload 时 await 读取）
+    await this.loadSettings();
+
+    // 初始化 i18n：跟随 Obsidian 界面语言（zh-cn / en）
+    await initI18n(this);
+
+    // 本插件专属标识符（view type / 命令 id / 显示名）：免费版为历史兼容值 dada-todo-view / open-dada-todo。
+    this.viewType = 'dada-todo-view';
+    this.viewTitle = t('app.viewTitle');
+    const commandId = 'open-dada-todo';
+    const ribbonIcon = 'check-square';
+
+    // 任务数据层注入插件实例（vault / metadataCache 读写）
+    initTasksApi(this);
+    // 核心「日记」插件未启用的提醒改为面板顶部提醒条（TasksApp 内，随面板实时检测）
+
+    // 收件箱文件不存在时创建（首次使用 / 用户改路径后）；
+    // 创建失败不阻断插件加载（仅后续写任务会报错）
+    try {
+      await ensureInboxFile();
+    } catch (e) {
+      console.warn('[DadaTodo] 创建收件箱文件失败：', e);
+    }
+
+    this.registerView(this.viewType, (leaf) => new DadaTodoView(leaf, this));
+
+    this.addRibbonIcon(ribbonIcon, t('app.openDada'), () => this.activateView());
+
+    this.addCommand({
+      id: commandId,
+      name: t('app.openDada'),
+      callback: () => this.activateView()
+    });
+
+    // 新建任务：直接弹出新建任务弹窗（复用 VueModal 桥，无需先打开视图）
+    this.addCommand({
+      id: 'new-task',
+      name: t('app.newTask'),
+      callback: () => {
+        new VueModal(this.app, TaskEditorModal, {
+          open: true,
+          plugin: this,
+          // 新建后若已有视图打开则静默刷新，让新任务即时出现
+          onSaved: () => this.reloadOpenViews()
+        }).open();
+      }
+    });
+
+    this.addSettingTab(new DadaTodoSettingTab(this.app, this));
+
+    console.log('[DadaTodo] 插件已加载');
+
+    // 开发期热更新（生产构建下 __DADA_DEV__ 为 false，整段会被摇掉）
+    if (__DADA_DEV__) {
+      setupDevReload(this);
+    }
+
+    // 复用核心「页面预览」：清单视图左侧文件列表悬停即弹出该清单笔记预览（无需自绘弹窗）
+    setupHoverPreview(this);
+
+    // 任务到点提醒：仅在 Obsidian 运行时生效（无后台推送）。开关默认关，
+    // 设置里打开后即时生效（服务每次扫描都读最新设置，无需重启）。
+    this.reminder = new ReminderService(this);
+    this.reminder.start();
+
+    // 明暗主题切换后，自动重算依赖主题的配色（如深色 / 浅色变体、块内文字等），无需手动切换视图
+    this.registerThemeColorRefresh();
+  }
+
+  /** 监听 Obsidian 明暗主题切换，自动重算依赖主题的配色（紫罗兰 dark/light 变体等） */
+  registerThemeColorRefresh() {
+    const body = document.body;
+    let dark = body.classList.contains('theme-dark');
+    const mo = new MutationObserver(() => {
+      const nowDark = body.classList.contains('theme-dark');
+      if (nowDark !== dark) {
+        dark = nowDark;
+        // 重算已打开视图的配色：与手动切换视图效果一致，块底色/标题字随主题即时更新
+        this.reloadOpenViews();
+      }
+    });
+    mo.observe(body, { attributes: true, attributeFilter: ['class'] });
+    this.register(() => mo.disconnect());
+  }
+
+  /** 在指定区域打开待办视图（left=左侧栏 / main=主窗口标签页 / right=右侧栏） */
+  async openInLocation(loc) {
+    const { workspace } = this.app;
+    let leaf;
+    if (loc === 'left') leaf = workspace.getLeftLeaf(true);
+    else if (loc === 'right') leaf = workspace.getRightLeaf(true);
+    else leaf = workspace.getLeaf('tab'); // 主窗口
+    await leaf.setViewState({ type: this.viewType, active: true });
+    workspace.revealLeaf(leaf);
+  }
+
+  /** 已打开则聚焦；否则按配置位置打开 */
+  async activateView() {
+    const { workspace } = this.app;
+    const existing = workspace.getLeavesOfType(this.viewType);
+    if (existing.length) {
+      workspace.revealLeaf(existing[0]);
+      return;
+    }
+    await this.openInLocation(this.settings.openLocation || 'main');
+  }
+
+  /** 切换打开位置：关闭现有面板并按新位置重新打开 */
+  async applyOpenLocation() {
+    this.app.workspace.detachLeavesOfType(this.viewType);
+    await this.openInLocation(this.settings.openLocation || 'main');
+  }
+
+  onunload() {
+    if (this.reminder) { this.reminder.stop(); this.reminder = null; }
+    this.app.workspace.detachLeavesOfType(this.viewType);
+    // 反注册核心「页面预览」来源，清理设置项里的本插件条目
+    teardownHoverPreview(this);
+  }
+
+  async loadSettings() {
+    const data = (await this.loadData()) || {};
+    // 清单识别标记（数组，任一命中即识别清单文件）：兼容旧单值 checklistTag → 数组
+    const checklistTags = Array.isArray(data.checklistTags) && data.checklistTags.length
+      ? data.checklistTags.map((s) => String(s).trim()).filter(Boolean)
+      : (typeof data.checklistTag === 'string' && data.checklistTag.trim()
+        ? [data.checklistTag.trim()]
+        : ['todoList']);
+    this.settings = {
+      // 打开位置：左侧栏 / 主工作区标签页 / 右侧栏
+      openLocation: data.openLocation || 'main',
+      // 菜单样式：horizontal（默认，底部横向胶囊）/ vertical（左侧竖向菜单，可展开收起）
+      menuStyle: data.menuStyle || 'horizontal',
+      // 是否显示农历与节假日（日 / 周 / 月视图表头与日历格）
+      showLunar: data.showLunar ?? true,
+      // 完成任务时是否在任务行追加「✅ 完成日期」标记；默认开。关闭后完成不写 ✅，开始/结束等日期标记不受影响
+      addDoneDateMarker: data.addDoneDateMarker ?? true,
+      // 无日期任务的存放文件（相对库根目录）
+      inboxFile: data.inboxFile || 'DadaTodoList.md',
+      // 日记（有日期任务）所在文件夹：相对库根目录，默认 '/' = 库根；扫描其及子目录下文件名含日期的笔记
+      journalFolder: data.journalFolder || '/',
+      // 日记文件宽松匹配：默认开；开启时从文件名任意位置抽取日期（兼容各种个性化命名），
+      // 关闭时仅当文件名以日期（或「星期-日期」）开头才视为日记，避免误判含日期的普通笔记
+      journalLooseMatch: data.journalLooseMatch ?? true,
+      // 每周起始日：0=周日 … 6=周六，默认 1（周一）
+      weekStart: data.weekStart ?? 1,
+      // 清单识别标记：frontmatter tags 含任一标签的笔记即清单文件
+      checklistTags,
+      // 每日笔记加载窗口（天）：以今天为中心的对称窗口（前后各 N 天），默认 'all'；大库可调小以提升加载性能
+      dailyLoadWindow: data.dailyLoadWindow || 'all',
+      // 任务块配色方案：default（默认）/ morandi（莫兰迪）/ jelly（卡通果冻），默认 default
+      colorScheme: data.colorScheme || 'default',
+      // 标签颜色映射（issue #8）：{ 标签名: CSS 颜色 }，命中的任务块整块用该颜色
+      tagColors: (data.tagColors && typeof data.tagColors === 'object' && !Array.isArray(data.tagColors)) ? data.tagColors : {},
+      // 日 / 周视图时间轴显示范围（整点小时）：开始 0–23、结束 1–24，结束须晚于开始；默认 0–24（全天）
+      timelineStartHour: Math.max(0, Math.min(23, Math.round(Number.isFinite(data.timelineStartHour) ? data.timelineStartHour : 0))),
+      timelineEndHour: (() => {
+        const s = Math.max(0, Math.min(23, Math.round(Number.isFinite(data.timelineStartHour) ? data.timelineStartHour : 0)));
+        let v = Math.max(1, Math.min(24, Math.round(Number.isFinite(data.timelineEndHour) ? data.timelineEndHour : 24)));
+        if (v <= s) v = s + 1;
+        if (v > 24) v = 24;
+        return v;
+      })(),
+      // 时间选择器步长（分钟）：下拉以该步长生成可选项（5–60，默认 5）
+      timeStep: Math.max(1, Math.min(60, Math.round(Number(data.timeStep) || 5))),
+      // 时间轴吸附粒度（分钟）：拖动 / 拉伸任务块与拖入落点按该步长吸附（5/10/15/30，默认 30）
+      snapMinutes: [5, 10, 15, 30].includes(Number(data.snapMinutes)) ? Number(data.snapMinutes) : 30,
+      // 计划时间（⏳ scheduled）：默认关闭；开启后编辑弹窗可设置计划日期，各视图显示计划日期徽标
+      showScheduled: data.showScheduled === true,
+      // 视图菜单：完整视图顺序（含隐藏项，保持其排序记忆）；默认全部按当前顺序
+      menuViews: normalizeMenuViews(data.menuViews),
+      // 视图菜单：隐藏的视图 key（不显示在菜单上，但保留排序，可随时在设置页重新勾选显示）
+      menuHiddenViews: normalizeMenuHidden(data.menuHiddenViews),
+      // 任务到点提醒总开关：默认关（避免更新后对所有任务突然弹通知），开启后即时生效并自带提示音
+      remindEnabled: data.remindEnabled === true,
+      // 提醒通道：system=系统通知（桌面端，需授权，不可用自动回落）/ in-app=只用 Obsidian 内提示
+      remindChannel: data.remindChannel === 'in-app' ? 'in-app' : 'system',
+      // 全天任务是否提醒（独立开关，默认关：只提醒有具体时刻的任务）
+      remindAllDay: data.remindAllDay === true,
+      // 全天任务的提醒时刻（HH:MM）：当天该时刻提醒当天的全天任务
+      remindAllDayTime: (() => {
+        const v = typeof data.remindAllDayTime === 'string' ? data.remindAllDayTime.trim() : '';
+        return /^(\d{1,2}):(\d{2})$/.test(v) ? v : '10:00';
+      })(),
+    };
+    // 让设置在 Vue 中具备响应式：菜单样式等设置改动后可即时生效，无需重启 Obsidian
+    this.settings = reactive(this.settings);
+    // 启动即用已保存的配色方案 / 每周起始日 / 标签颜色初始化（视图重载时会按此重算）
+    setColorScheme(this.settings.colorScheme);
+    setWeekStart(this.settings.weekStart);
+    setTagColors(this.settings.tagColors);
+  }
+
+  async saveSettings() {
+    await this.saveData(this.settings);
+  }
+
+  // 标签改色的统一入口（issue #8）：落盘 + 注入取色层 + 刷新各视图。
+  // TasksApp 侧栏弹窗与设置页共用；color 为空串 = 清除该标签的颜色
+  async setTagColor(tag, color) {
+    const next = Object.assign({}, this.settings.tagColors || {});
+    if (color) next[tag] = color; else delete next[tag];
+    this.settings.tagColors = next;
+    await this.saveSettings();
+    setTagColors(next);
+    this.reloadOpenViews();
+  }
+
+  // 数据相关设置（每日笔记加载范围 / 收件箱路径）变更后调用：
+  // 刷新所有已打开的面板，让新配置立即生效，无需手动重开面板
+  reloadOpenViews() {
+    const leaves = this.app.workspace.getLeavesOfType(this.viewType);
+    for (const leaf of leaves) {
+      const v = leaf.view;
+      const ok = !!(v && v.vueRoot && typeof v.vueRoot.load === 'function');
+      if (ok) v.vueRoot.load();
+    }
+  }
+}

@@ -1,0 +1,1 @@
+import {connect} from './cdp.mjs';const c=await connect();await c.send('Runtime.enable');await new Promise(r=>setTimeout(r,500));console.log(JSON.stringify(c.events.filter(e=>e.method==='Runtime.exceptionThrown'||(e.method==='Runtime.consoleAPICalled'&&e.params.type==='error')),null,2));c.close();

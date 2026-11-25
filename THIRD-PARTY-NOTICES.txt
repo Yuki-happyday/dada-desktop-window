@@ -1,0 +1,20 @@
+Dada Desktop Window / dada-desktop-window 1.0.5
+
+Unofficial personal extension maintained by Yuki-happyday, developed with
+assistance from Codex. The upstream author is not responsible for this extension.
+
+Task UI and Markdown task access adapted from:
+Dada Todo List, by Plover
+https://github.com/Plover-PY/obsidian-DadaTodoList
+Tag: 0.12.2
+Commit: 327b08caf3dff7406976cfea11e22b5133e66c1f
+License: MIT; original copyright and license retained in LICENSE.
+
+Changes include independent plugin identity, a desktop window, edge docking,
+hide/reveal state, window-specific DOM/event/modal routing, lazy UI loading,
+isolated styles, UI preferences and atomic local window configuration storage.
+Installation does not replace the upstream plugin files.
+
+Bundled runtime dependencies:
+Vue 3 (MIT), i18next (MIT), lunar-javascript (MIT), Line Awesome (MIT).
+Their license texts are reproduced in THIRD-PARTY-LICENSES.txt.

@@ -1,0 +1,763 @@
+import { PluginSettingTab, Notice, AbstractInputSuggest, TFolder, setIcon } from 'obsidian';
+import { t } from '../i18n/index.js';
+import { TagColorModal } from './modals.js';
+import { countInboxTasks, migrateInboxTasks, loadAll, loadChecklists, collectTags } from '../api/tasks.js';
+import { setColorScheme, setWeekStart, tagColorOf, usedTagColors, EXTRA_SCHEME_OPTIONS, isImeKey } from '../composables/tasks-logic.js';
+import { VIEW_MENU_ITEMS, DEFAULT_MENU_VIEWS, reorderViews } from '../composables/viewMenu.js';
+
+// 自检新版：比对 GitHub 仓库 main 分支 manifest 的 version 与本地版本
+const UPDATE_REPO = 'Plover-PY/obsidian-DadaTodoList';
+
+// 语义化版本号比较（'x.y.z'）：a>b → 1，a<b → -1，相等 → 0
+function semverCompare(a, b) {
+  const pa = String(a || '').split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = String(b || '').split('.').map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = pa[i] || 0, y = pb[i] || 0;
+    if (x > y) return 1;
+    if (x < y) return -1;
+  }
+  return 0;
+}
+
+// 取线上最新版本号（GitHub raw manifest，main 分支）；失败抛错由调用处静默处理
+async function fetchLatestVersion() {
+  const url = 'https://raw.githubusercontent.com/' + UPDATE_REPO + '/main/manifest.json';
+  const res = await fetch(url, { cache: 'no-store' });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const data = await res.json();
+  return data && data.version ? data.version : null;
+}
+
+// 收件箱文件路径补全：输入时浮层建议库内 md 文件（也允许手输尚不存在的路径，启动时会自动创建）
+class MarkdownFileSuggest extends AbstractInputSuggest {
+  constructor(app, inputEl, onPick) {
+    super(app, inputEl);
+    this.onPick = onPick;
+  }
+
+  getSuggestions(query) {
+    const q = String(query || '').toLowerCase().replace(/^\/+/, '');
+    return this.app.vault.getMarkdownFiles()
+      .filter((f) => f.path.toLowerCase().includes(q))
+      .slice(0, 30);
+  }
+
+  renderSuggestion(file, el) {
+    el.setText(file.path);
+  }
+
+  selectSuggestion(file) {
+    this.setValue(file.path);
+    if (this.onPick) this.onPick(file.path);
+    this.close();
+  }
+}
+
+// 日记文件夹输入补全：输入时浮层建议库内文件夹（含库根 /）
+export class FolderSuggest extends AbstractInputSuggest {
+  constructor(app, inputEl, onPick) {
+    super(app, inputEl);
+    this.onPick = onPick;
+  }
+
+  getSuggestions(query) {
+    const q = String(query || '').toLowerCase().replace(/^\/+/, '');
+    return this.app.vault.getAllLoadedFiles()
+      .filter((f) => f instanceof TFolder && f.path.toLowerCase().includes(q))
+      .slice(0, 30);
+  }
+
+  renderSuggestion(folder, el) {
+    el.setText(folder.path || '/');
+  }
+
+  selectSuggestion(folder) {
+    const v = folder.path || '/';
+    this.setValue(v);
+    if (this.onPick) this.onPick(v);
+    this.close();
+  }
+}
+
+// ============================================================================
+// Dada Todo · 设置页（Obsidian 1.13+ 声明式 API，getSettingDefinitions）
+// ----------------------------------------------------------------------------
+// 注意：本版本 Obsidian 仅消费 getSettingDefinitions()，经典 display() 已不生效。
+// 最外层平铺各基础分区（关于 / 面板与外观 / 日记设置 / 收件箱与清单 / 视图与日程 /
+// 任务标记 / 标签颜色），每个分区用 `type:'group'` + `heading` 给出小标题，组内
+// 用 `type:'setting'` + `render` 渲染原有控件（外观与经典 SettingTab 一致）。
+// ============================================================================
+
+export class DadaTodoSettingTab extends PluginSettingTab {
+  constructor(app, plugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  getSettingDefinitions() {
+    try {
+    const plugin = this.plugin;
+    const app = this.app;
+    const T = (k, opts) => t('settings.' + k, opts);
+    // 临时调试：包裹每个渲染回调，抛错时把错误显示在对应项内而非中断整页渲染
+    const safe = (fn) => (s, g) => {
+      try { return fn(s, g); } catch (e) {
+        try {
+          s.setName('⚠ 渲染失败（调试）');
+          const pre = s.settingEl.createDiv('dt-debug');
+          pre.setText(String((e && e.stack) || e));
+        } catch (_) { /* 忽略 */ }
+      }
+    };
+    // 自定义内容挂到 s.controlEl（即 .setting-item-control）——声明式 API 下自定义内容的唯一可靠挂载点，
+    // 与 myPara-Plugin 的 s.controlEl.appendChild 写法一致。把整行 setting 改成「无外壳的整块容器」：
+    // 整块 block 布局、隐藏名称标签、控件槽占满整行，从而卡片/标题满宽、无 .setting-item 背景框。
+    const plainBlock = (s) => {
+      s.settingEl.style.display = 'block';
+      s.settingEl.style.border = 'none';
+      s.settingEl.style.background = 'transparent';
+      s.settingEl.style.boxShadow = 'none';
+      s.settingEl.style.padding = '0';
+      if (s.infoEl) s.infoEl.style.display = 'none';
+      s.controlEl.style.flex = '1 1 100%';
+      s.controlEl.style.width = '100%';
+      s.controlEl.style.marginLeft = '0';
+      s.controlEl.empty();
+      return s.controlEl;
+    };
+    // 分组：带小标题的一组设置项
+    const group = (headingKey, items) => ({ type: 'group', heading: T(headingKey), items });
+    // 行：名称 + 说明 + 控件。name/desc 既写进定义（供搜索/渲染），render 里也显式 set 一次，
+    // 兼容「声明式不自动渲染名称」的情况；两种路径文案一致，不会重复。
+    const row = (nameKey, descKey, render) => ({
+      type: 'setting',
+      name: T(nameKey),
+      desc: descKey ? T(descKey) : '',
+      render: safe((s, g) => {
+        s.setName(T(nameKey));
+        s.setDesc(descKey ? T(descKey) : '');
+        return render(s, g);
+      }),
+    });
+
+    // 分组：面板与外观
+    const appearance = group('groupAppearance', [
+      row('openLocation', 'openLocationDesc', (s) => {
+        s.addDropdown((dd) => {
+          dd.addOption('left', T('locLeft'));
+          dd.addOption('main', T('locMain'));
+          dd.addOption('right', T('locRight'));
+          dd.setValue(plugin.settings.openLocation || 'main');
+          dd.onChange(async (value) => {
+            plugin.settings.openLocation = value;
+            await plugin.saveSettings();
+            await plugin.applyOpenLocation();
+          });
+        });
+      }),
+      row('menuStyle', 'menuStyleDesc', (s) => {
+        s.addDropdown((dd) => {
+          dd.addOption('horizontal', T('menuHorizontal'));
+          dd.addOption('vertical', T('menuVertical'));
+          dd.setValue(plugin.settings.menuStyle || 'horizontal');
+          dd.onChange(async (value) => {
+            plugin.settings.menuStyle = value;
+            await plugin.saveSettings();
+          });
+        });
+      }),
+      // 视图菜单：勾选控制显示 / 隐藏，整行拖拽排序；默认全部显示、按当前顺序
+      row('menuViews', 'menuViewsDesc', (s) => {
+        // 控件整行换行到标题（名称 + 说明）下方，而不是挤在右侧控件列
+        s.settingEl.style.flexWrap = 'wrap';
+        s.controlEl.style.flex = '1 1 100%';
+        s.controlEl.style.width = '100%';
+        s.controlEl.style.marginLeft = '0';
+        s.controlEl.style.marginTop = '6px';
+        const st = plugin.settings;
+        const host = s.controlEl.createDiv('dt-menuviews');
+        const render = () => {
+          host.empty();
+          const order = (Array.isArray(st.menuViews) && st.menuViews.length) ? st.menuViews : DEFAULT_MENU_VIEWS;
+          const hidden = new Set(Array.isArray(st.menuHiddenViews) ? st.menuHiddenViews : []);
+          const byKey = {};
+          for (const v of VIEW_MENU_ITEMS) byKey[v.key] = v;
+          let dragKey = '';
+          for (const key of order) {
+            const def = byKey[key];
+            if (!def) continue;
+            const item = host.createDiv('dt-menuviews-item' + (hidden.has(key) ? ' is-hidden' : ''));
+            item.draggable = true;
+            const grip = item.createSpan({ cls: 'dt-menuviews-grip' });
+            setIcon(grip, 'grip-vertical');
+            const cb = item.createEl('input', { type: 'checkbox' });
+            cb.checked = !hidden.has(key);
+            cb.setAttribute('aria-label', t(def.labelKey));
+            cb.addEventListener('change', async () => {
+              const set = new Set(Array.isArray(st.menuHiddenViews) ? st.menuHiddenViews : []);
+              if (cb.checked) set.delete(key); else set.add(key);
+              st.menuHiddenViews = [...set];
+              await plugin.saveSettings();
+              item.toggleClass('is-hidden', !cb.checked);
+            });
+            item.createSpan({ text: t(def.labelKey), cls: 'dt-menuviews-label' });
+            // 拖拽排序：dragstart 记录源 key，drop 时重排完整顺序（含隐藏项）并重绘
+            item.addEventListener('dragstart', () => { dragKey = key; item.addClass('is-dragging'); });
+            item.addEventListener('dragend', () => {
+              dragKey = '';
+              item.removeClass('is-dragging');
+              host.querySelectorAll('.dt-menuviews-item.is-over').forEach((n) => n.removeClass('is-over'));
+            });
+            item.addEventListener('dragover', (e) => {
+              if (!dragKey || dragKey === key) return;
+              e.preventDefault();
+              if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+              item.addClass('is-over');
+            });
+            item.addEventListener('dragleave', () => item.removeClass('is-over'));
+            item.addEventListener('drop', async (e) => {
+              e.preventDefault();
+              item.removeClass('is-over');
+              if (!dragKey || dragKey === key) return;
+              const next = reorderViews(order, dragKey, key);
+              if (next !== order) {
+                st.menuViews = next;
+                await plugin.saveSettings();
+                render();
+              }
+            });
+          }
+        };
+        render();
+      }),
+      row('colorScheme', 'colorSchemeDesc', (s) => {
+        s.addDropdown((dd) => {
+          dd.addOption('default', T('schemeDefault'));
+          dd.addOption('morandi', T('schemeMorandi'));
+          dd.addOption('jelly', T('schemeJelly'));
+          dd.addOption('spring', T('schemeSpring'));
+          dd.addOption('summer', T('schemeSummer'));
+          dd.addOption('autumn', T('schemeAutumn'));
+          dd.addOption('winter', T('schemeWinter'));
+          // 额外配色选项由 EXTRA_SCHEME_OPTIONS 注入；免费版该表为空则不显示
+          for (const opt of EXTRA_SCHEME_OPTIONS) dd.addOption(opt.key, t(opt.labelKey));
+          dd.setValue(plugin.settings.colorScheme || 'default');
+          dd.onChange(async (value) => {
+            plugin.settings.colorScheme = value;
+            await plugin.saveSettings();
+            setColorScheme(value);
+            plugin.reloadOpenViews();
+          });
+        });
+      }),
+      row('showLunar', 'showLunarDesc', (s) => {
+        s.addToggle((tg) => {
+          tg.setValue(plugin.settings.showLunar !== false);
+          tg.onChange(async (value) => {
+            plugin.settings.showLunar = value;
+            await plugin.saveSettings();
+            plugin.reloadOpenViews();
+          });
+        });
+      }),
+    ]);
+
+    // 分组：日记设置（日记文件夹 / 每日笔记加载范围）
+    const journal = group('groupJournal', [
+      row('journalFolder', 'journalFolderDesc', (s) => {
+        s.addText((tx) => {
+          tx.setPlaceholder('/');
+          tx.setValue(plugin.settings.journalFolder || '/');
+          tx.onChange((value) => {
+            plugin.settings.journalFolder = (value || '/').trim() || '/';
+            plugin.saveSettings();
+          });
+          new FolderSuggest(app, tx.inputEl, (path) => {
+            plugin.settings.journalFolder = (path || '/').trim() || '/';
+            plugin.saveSettings();
+          });
+        });
+      }),
+      row('dailyWindow', 'dailyWindowDesc', (s) => {
+        s.addDropdown((dd) => {
+          dd.addOption('30', T('days30'));
+          dd.addOption('90', T('days90'));
+          dd.addOption('180', T('days180'));
+          dd.addOption('365', T('days365'));
+          dd.addOption('all', T('daysAll'));
+          dd.setValue(plugin.settings.dailyLoadWindow || 'all');
+          dd.onChange(async (value) => {
+            plugin.settings.dailyLoadWindow = value;
+            await plugin.saveSettings();
+            plugin.reloadOpenViews();
+          });
+        });
+      }),
+    ]);
+
+    // 分组：收件箱与清单（无日期任务文件 / 清单识别标记）
+    const inbox = group('groupInbox', [
+      row('inboxFile', 'inboxFileDesc', (s) => {
+        s.addText((tx) => {
+          tx.setPlaceholder('DadaTodoList.md');
+          tx.setValue(plugin.settings.inboxFile || 'DadaTodoList.md');
+          this._inboxCommitted = plugin.settings.inboxFile || 'DadaTodoList.md';
+          tx.onChange((value) => this.handleInboxPathChange(value));
+          new MarkdownFileSuggest(app, tx.inputEl, (path) => this.handleInboxPathChange(path));
+        });
+      }),
+      row('checklistTag', 'checklistTagDesc', (s) => {
+        // 多标签编辑器：回车添加 → 胶囊展示，× 移除
+        const editor = s.controlEl.createDiv('dt-tags-editor');
+        const renderChips = () => {
+          editor.querySelectorAll('.dt-chip').forEach((n) => n.remove());
+          const inputEl = editor.querySelector('input');
+          for (const tag of plugin.settings.checklistTags) {
+            const chip = editor.createDiv('dt-chip');
+            chip.createSpan({ text: tag });
+            const del = chip.createEl('button', { text: '×' });
+            del.setAttribute('aria-label', tag);
+            del.addEventListener('click', async () => {
+              plugin.settings.checklistTags = plugin.settings.checklistTags.filter((x) => x !== tag);
+              await plugin.saveSettings();
+              renderChips();
+            });
+            if (inputEl) editor.insertBefore(chip, inputEl); else editor.appendChild(chip);
+          }
+        };
+        const tagInput = editor.createEl('input', { type: 'text', placeholder: T('tagPlaceholder') });
+        tagInput.addEventListener('keydown', async (e) => {
+          // 输入法组字中的回车只上屏候选词，不提交标签
+          if (isImeKey(e)) return;
+          if (e.key === 'Enter' && tagInput.value.trim()) {
+            e.preventDefault();
+            const v = tagInput.value.trim().replace(/^#/, '');
+            if (!plugin.settings.checklistTags.includes(v)) plugin.settings.checklistTags.push(v);
+            await plugin.saveSettings();
+            tagInput.value = '';
+            renderChips();
+          }
+        });
+        renderChips();
+      }),
+    ]);
+
+    // 分组：视图与日程（周起始 / 时间轴范围 / 时间选择器步长）
+    const views = group('groupViews', [
+      row('weekStart', 'weekStartDesc', (s) => {
+        s.addDropdown((dd) => {
+          dd.addOption('0', T('weekSun'));
+          dd.addOption('1', T('weekMon'));
+          dd.addOption('2', T('weekTue'));
+          dd.addOption('3', T('weekWed'));
+          dd.addOption('4', T('weekThu'));
+          dd.addOption('5', T('weekFri'));
+          dd.addOption('6', T('weekSat'));
+          dd.setValue(String(plugin.settings.weekStart ?? 1)); // 默认周一
+          dd.onChange(async (value) => {
+            const n = parseInt(value, 10) || 0;
+            plugin.settings.weekStart = n;
+            await plugin.saveSettings();
+            setWeekStart(n);
+            plugin.reloadOpenViews();
+          });
+        });
+      }),
+      row('timelineRange', 'timelineRangeDesc', (s) => {
+        s.addDropdown((dd) => {
+          for (let h = 0; h <= 23; h++) dd.addOption(String(h), (h < 10 ? '0' : '') + h + ':00');
+          dd.setValue(String(plugin.settings.timelineStartHour ?? 0));
+          dd.onChange(async (value) => {
+            const start = parseInt(value, 10);
+            let end = plugin.settings.timelineEndHour ?? 24;
+            if (end <= start) { end = start + 1; if (end > 24) end = 24; plugin.settings.timelineEndHour = end; }
+            plugin.settings.timelineStartHour = start;
+            await plugin.saveSettings();
+            plugin.reloadOpenViews();
+          });
+        }).addDropdown((dd) => {
+          for (let h = 1; h <= 24; h++) dd.addOption(String(h), (h < 10 ? '0' : '') + h + ':00');
+          dd.setValue(String(plugin.settings.timelineEndHour ?? 24));
+          dd.onChange(async (value) => {
+            let end = parseInt(value, 10);
+            const start = plugin.settings.timelineStartHour ?? 0;
+            if (end <= start) end = start + 1;
+            if (end > 24) end = 24;
+            plugin.settings.timelineEndHour = end;
+            await plugin.saveSettings();
+            plugin.reloadOpenViews();
+          });
+        });
+      }),
+      row('timeStep', 'timeStepDesc', (s) => {
+        s.addDropdown((dd) => {
+          for (let m = 5; m <= 60; m += 5) dd.addOption(String(m), String(m) + T('minuteUnit'));
+          dd.setValue(String(plugin.settings.timeStep || 5));
+          dd.onChange(async (value) => {
+            plugin.settings.timeStep = parseInt(value, 10) || 5;
+            await plugin.saveSettings();
+            plugin.reloadOpenViews();
+          });
+        });
+      }),
+      row('snapMinutes', 'snapMinutesDesc', (s) => {
+        s.addDropdown((dd) => {
+          for (const m of [5, 10, 15, 30]) dd.addOption(String(m), String(m) + T('minuteUnit'));
+          dd.setValue(String(plugin.settings.snapMinutes || 30));
+          dd.onChange(async (value) => {
+            plugin.settings.snapMinutes = parseInt(value, 10) || 30;
+            await plugin.saveSettings();
+            plugin.reloadOpenViews();
+          });
+        });
+      }),
+    ]);
+
+    // 全天任务时间行的 DOM：由开关联动显示 / 隐藏（声明式渲染后再补一次，避免样式被覆盖）
+    let allDayTimeRowEl = null;
+    const setAllDayTimeVisible = (on) => {
+      if (!allDayTimeRowEl) return;
+      allDayTimeRowEl.style.display = on ? '' : 'none';
+    };
+    // 分组：提醒（顺序：总开关 → 全天任务开关 + 时间 → 通知方式 → 测试按钮）
+    //   平台限制写在总开关的说明里（带 ⚠️），不再单列提示行
+    //   - 提示音：开启提醒即自带，不做开关与音量设置
+    //   - 通知方式：系统通知优先，拿不到权限自动回落应用内
+    //   - 系统通知权限：打开总开关时顺便申请（点击即用户手势），不单列设置项
+    const reminder = group('groupReminder', [
+      row('remindEnabled', 'remindEnabledDesc', (s) => {
+        s.addToggle((tg) => {
+          tg.setValue(plugin.settings.remindEnabled === true); // 默认关
+          tg.onChange(async (value) => {
+            plugin.settings.remindEnabled = value;
+            await plugin.saveSettings();
+            if (!value || !plugin.reminder) return;
+            // 打开总开关时申请系统通知权限（此刻正处于点击手势中，浏览器才接受申请）
+            if (plugin.reminder.permission === 'default') await plugin.reminder.requestPermission();
+            // 立刻扫描一遍，不用等下一个 5 分钟窗口
+            await plugin.reminder.refresh();
+          });
+        });
+      }),
+      row('remindAllDay', 'remindAllDayDesc', (s) => {
+        s.addToggle((tg) => {
+          tg.setValue(plugin.settings.remindAllDay === true); // 默认关
+          tg.onChange(async (value) => {
+            plugin.settings.remindAllDay = value;
+            await plugin.saveSettings();
+            setAllDayTimeVisible(value);
+            if (value && plugin.reminder) await plugin.reminder.refresh();
+          });
+        });
+      }),
+      row('remindAllDayTime', 'remindAllDayTimeDesc', (s) => {
+        // 全天任务开关关闭时整行隐藏（开关与时间在视觉上成一组）
+        allDayTimeRowEl = s.settingEl;
+        setAllDayTimeVisible(plugin.settings.remindAllDay === true);
+        // 声明式渲染可能随后重置行样式，下一帧再补一次
+        requestAnimationFrame(() => setAllDayTimeVisible(plugin.settings.remindAllDay === true));
+        s.addText((tx) => {
+          // 时间选择器：Obsidian 无内置时间控件，用原生 <input type="time">（Electron/Chromium 均支持）
+          tx.inputEl.type = 'time';
+          tx.inputEl.step = '60';
+          tx.setValue(plugin.settings.remindAllDayTime || '10:00');
+          tx.onChange(async (value) => {
+            const v = String(value || '').trim();
+            if (!/^(\d{1,2}):(\d{2})$/.test(v)) return; // 非法值不落盘
+            plugin.settings.remindAllDayTime = v;
+            await plugin.saveSettings();
+            if (plugin.reminder) await plugin.reminder.refresh();
+          });
+        });
+      }),
+      row('remindChannel', 'remindChannelDesc', (s) => {
+        s.addDropdown((dd) => {
+          dd.addOption('system', T('remindSystem'));
+          dd.addOption('in-app', T('remindInApp'));
+          dd.setValue(plugin.settings.remindChannel === 'in-app' ? 'in-app' : 'system');
+          dd.onChange(async (value) => {
+            plugin.settings.remindChannel = value;
+            await plugin.saveSettings();
+          });
+        });
+      }),
+      row('remindTest', 'remindTestDesc', (s) => {
+        s.addButton((b) => {
+          b.setButtonText(T('remindTestBtn'));
+          b.onClick(async () => {
+            if (plugin.reminder) await plugin.reminder.sendTest();
+          });
+        });
+      }),
+    ]);
+
+    // 分组：任务标记（完成日期标记 / 计划时间开关）
+    const taskMark = group('groupTaskMark', [
+      row('addDoneDateMarker', 'addDoneDateMarkerDesc', (s) => {
+        s.addToggle((tg) => {
+          tg.setValue(plugin.settings.addDoneDateMarker !== false); // 默认开
+          tg.onChange(async (value) => {
+            plugin.settings.addDoneDateMarker = value;
+            await plugin.saveSettings();
+          });
+        });
+      }),
+      row('showScheduled', 'showScheduledDesc', (s) => {
+        s.addToggle((tg) => {
+          tg.setValue(plugin.settings.showScheduled === true);
+          tg.onChange(async (v) => {
+            plugin.settings.showScheduled = v === true;
+            await plugin.saveSettings();
+            plugin.reloadOpenViews();
+          });
+        });
+      }),
+    ]);
+
+    // 分组：关于（软件信息 / 作者 / 反馈渠道）
+    const GH_REPO = 'https://github.com/Plover-PY/obsidian-DadaTodoList';
+    const GH_ISSUES = GH_REPO + '/issues';
+    // 作者小红书主页：用户提供链接后填入此处；留空则不显示小红书按钮
+    const XIAOHONGSHU_URL = 'https://xhslink.cn/o/2G9OTVU76WP';
+    // 关于：三条标准 setting 行（左侧 name/desc，右侧 版本标签 / 链接按钮），布局参照 EasySync 的关于。
+    const COMMUNITY_URL = 'https://community.obsidian.md/plugins/' + plugin.manifest.id;
+
+    // 右侧链接按钮：图标 + 文字，点击新窗打开
+    const aboutButton = (parent, icon, label, url) => {
+      const a = parent.createEl('a', { cls: 'dt-about-btn' });
+      a.setAttribute('href', url);
+      a.setAttribute('target', '_blank');
+      a.setAttribute('rel', 'noopener');
+      setIcon(a, icon);
+      a.createSpan({ text: label });
+    };
+
+    const about = group('groupAbout', [
+      // 第一行：左侧 插件名（名称）+ 自检新版状态（说明）；右侧 当前版本号 + 更新日志按钮
+      {
+        type: 'setting',
+        name: plugin.manifest.name,
+        desc: '',
+        render: safe((s) => {
+          s.setName(plugin.manifest.name);
+          // 左侧说明区：每次打开设置都自检新版，显示是否最新 / 可更新及最新版本号
+          const statusEl = s.descEl.createSpan({ cls: 'dt-about-update-status' });
+          this.checkForUpdate(statusEl, T);
+          // 右侧控件：当前版本号 + 更新日志按钮
+          const row = s.controlEl.createDiv('dt-about-links');
+          row.createSpan({ text: T('version') + ' ' + (plugin.manifest.version || ''), cls: 'dt-about-version-tag' });
+          aboutButton(row, 'lucide-history', T('changelog'), GH_REPO + '/releases');
+        }),
+      },
+      // 第二行：作者（左：label「作者」+ 作者名） + 插件首页 / GitHub / 小红书 按钮（右）
+      {
+        type: 'setting',
+        name: T('author'),
+        desc: plugin.manifest.author || '',
+        render: safe((s) => {
+          s.setName(T('author'));
+          s.setDesc(plugin.manifest.author || '');
+          const links = s.controlEl.createDiv('dt-about-links');
+          aboutButton(links, 'home', T('pluginHomepage'), COMMUNITY_URL);
+          aboutButton(links, 'github', T('github'), plugin.manifest.authorUrl || GH_REPO);
+          if (XIAOHONGSHU_URL) aboutButton(links, 'book', T('xiaohongshu'), XIAOHONGSHU_URL);
+        }),
+      },
+      // 第三行：问题反馈（label + 提示文案，「提交 Issue」为跳转 GitHub Issue 的超链接）
+      {
+        type: 'setting',
+        name: T('feedbackTitle'),
+        desc: T('feedbackDesc'),
+        render: safe((s) => {
+          s.setName(T('feedbackTitle'));
+          const descEl = s.descEl;
+          descEl.empty();
+          const tpl = T('feedbackDesc');
+          const token = '{issue}';
+          const idx = tpl.indexOf(token);
+          if (idx === -1) {
+            descEl.setText(tpl);
+            return;
+          }
+          descEl.appendText(tpl.slice(0, idx));
+          const a = descEl.createEl('a', { text: T('feedbackLink'), href: GH_ISSUES });
+          a.setAttribute('target', '_blank');
+          a.setAttribute('rel', 'noopener');
+          a.addClass('dt-about-feedback-link');
+          descEl.appendText(tpl.slice(idx + token.length));
+        }),
+      },
+      // 第四行：重建索引（重新扫描全部任务源并重建内存任务列表，视图数据异常时使用）
+      {
+        type: 'setting',
+        name: T('rebuildIndex'),
+        desc: T('rebuildIndexDesc'),
+        render: safe((s) => {
+          s.setName(T('rebuildIndex'));
+          s.setDesc(T('rebuildIndexDesc'));
+          s.addButton((btn) => {
+            btn.setButtonText(T('rebuildIndexBtn'));
+            btn.onClick(async () => {
+              const start = Date.now();
+              new Notice(T('rebuildIndexRunning'));
+              try {
+                // 全量重扫三个任务源（日记 / 收件箱 / 清单）重建内存任务列表，再刷新所有已打开视图
+                await Promise.all([loadAll(), loadChecklists()]);
+                plugin.reloadOpenViews();
+                new Notice(T('rebuildIndexDone') + '（' + Math.round((Date.now() - start) / 1000) + 's）');
+              } catch (e) {
+                new Notice(T('rebuildIndexFail') + (e && e.message || e));
+              }
+            });
+          });
+        }),
+      },
+    ]);
+
+    // 顶部不再单独渲染插件名 + 版本标题行：Obsidian 设置页 Tab 标题本身已是插件名，避免重复
+
+    // ---------- 标签颜色（issue #8：标签 → 任务块颜色映射维护） ----------
+    const tagColorGroup = group('groupTagColors', [
+      {
+        type: 'setting',
+        name: T('tagColors'),
+        desc: T('tagColorsDesc'),
+        render: safe((s) => {
+          s.setName(T('tagColors'));
+          s.setDesc(T('tagColorsDesc'));
+          // 标签胶囊网格独占一行：control 撑满整行换到名称/说明下方（见 .dt-tagcolor-setting）
+          s.settingEl.addClass('dt-tagcolor-setting');
+          const root = s.controlEl;
+          root.empty();
+          // 重建整个维护区（改色后调用）；落盘统一走 plugin.setTagColor（含 data.json 持久化与视图刷新）
+          const build = () => {
+            root.empty();
+            // 点圆圈弹取色弹窗设置 / 清除（选「无颜色」即删除映射）
+            const openPicker = (name) => {
+              new TagColorModal(plugin.app, {
+                tag: name,
+                color: tagColorOf(name),
+                customColors: usedTagColors(plugin.settings.tagColors),
+                onSave: (t2, color2) => plugin.setTagColor(t2, color2).then(build)
+              }).open();
+            };
+            // 横向胶囊：标签名在前、颜色圆圈在后；已配置实色、未配置空心，点圆圈设置
+            const renderGrid = (names) => {
+              root.empty();
+              const grid = root.createDiv('dt-tagcolor-grid');
+              if (!names.length) {
+                grid.createSpan({ cls: 'dt-tagcolor-empty', text: T('tagColorsEmpty') });
+                return;
+              }
+              for (const name of names) {
+                const color = tagColorOf(name);
+                const chip = grid.createDiv('dt-tagcolor-chip');
+                chip.createSpan({ text: '#' + name, cls: 'dt-tagcolor-name' });
+                const dot = chip.createSpan({ cls: 'dt-tagcolor-dot' + (color ? '' : ' is-empty') });
+                if (color) dot.style.background = color;
+                if (typeof dot.setTooltip === 'function') dot.setTooltip(T('tagColorTip'));
+                else dot.setAttribute('aria-label', T('tagColorTip'));
+                dot.addEventListener('click', () => openPicker(name));
+              }
+            };
+            // 全量任务标签（与列表页侧栏同口径，按名称排序）；collectTags 失败时兜底只显示已配置的
+            collectTags()
+              .then((list) => renderGrid((list || []).map((s) => s.name).sort((a, b) => a.localeCompare(b))))
+              .catch(() => renderGrid(Object.keys(plugin.settings.tagColors || {}).sort((a, b) => a.localeCompare(b))));
+          };
+          build();
+        }),
+      },
+    ]);
+
+    // 关于置顶：让用户第一眼看到插件信息与求助入口（issue 反馈 / 重建索引入口也在此）
+    const defs = [about, appearance, journal, inbox, views, reminder, taskMark, tagColorGroup];
+    return defs;
+    } catch (e) {
+      // 定义阶段抛错（非常罕见）：直接显示错误
+      return [{
+        type: 'group',
+        heading: '⚠ getSettingDefinitions 抛错（调试）',
+        items: [{
+          type: 'setting',
+          name: 'ERROR',
+          desc: String((e && e.message) || e),
+          render: (s) => {
+            const pre = s.settingEl.createDiv('dt-debug');
+            pre.setText(String((e && e.stack) || e));
+          }
+        }]
+      }];
+    }
+  }
+
+  // 自检新版：每次打开设置页（关于区第一行）自动调用。
+  // 比对 GitHub 仓库 main 分支 manifest 的 version 与本地 manifest.version；
+  // 结果写在左侧说明区：是否最新，若不是则提示可更新并给出最新版本号与发布页链接。
+  async checkForUpdate(el, T) {
+    const cur = this.plugin.manifest.version || '';
+    el.setText(T('updateChecking'));
+    el.addClass('dt-about-update-checking');
+    try {
+      const latest = await fetchLatestVersion();
+      el.removeClass('dt-about-update-checking');
+      el.empty();
+      if (!latest) return; // 取不到版本号：不提示
+      const cmp = semverCompare(latest, cur);
+      if (cmp > 0) {
+        el.addClass('dt-about-update-available');
+        el.createSpan({ text: T('updateAvailable', { version: latest }) });
+        // 「前往更新」：点击直接打开 Obsidian 设置里的「第三方插件」页（非网页）
+        const link = el.createEl('span', { cls: 'dt-about-update-link' });
+        link.setText(T('updateGoto'));
+        link.addEventListener('click', (e) => {
+          e.preventDefault();
+          const settings = this.app.setting;
+          settings.open();
+          settings.openTabById('community-plugins');
+        });
+      } else if (cmp === 0) {
+        el.addClass('dt-about-update-latest');
+        el.setText(T('updateLatest'));
+      }
+      // cmp < 0（本地版本比线上还新，如开发版）：不提示
+    } catch (e) {
+      el.removeClass('dt-about-update-checking');
+      el.setText(''); // 网络不可达 / 被拦截：静默忽略，不影响设置页
+    }
+  }
+
+  // 收件箱路径变更（输入逐字符触发 / 补全选中触发）：去抖 1s 后统一处理
+  handleInboxPathChange(value) {
+    const newPath = String(value || '').trim() || 'DadaTodoList.md';
+    this.plugin.settings.inboxFile = newPath;
+    this.plugin.saveSettings();
+    if (newPath === this._inboxCommitted) return;
+    const from = this._inboxCommitted;
+    clearTimeout(this._inboxMoveTimer);
+    this._inboxMoveTimer = setTimeout(async () => {
+      await this.offerInboxMove(from, newPath);
+      this._inboxCommitted = newPath;
+    }, 1000);
+  }
+
+  // 收件箱换路径：旧文件还有任务时询问是否整体迁移
+  async offerInboxMove(oldPath, newPath) {
+    const n = await countInboxTasks(oldPath);
+    // 无论迁移与否，收件箱路径变了 → 任务池变化，刷新已打开的面板
+    this.plugin.reloadOpenViews();
+    if (!n) return;
+    const notice = new Notice(t('settings.inboxMoveAsk', { n }), 0);
+    const go = notice.noticeEl.createEl('button', { text: t('settings.inboxMoveGo') });
+    go.style.marginRight = '8px';
+    go.addEventListener('click', async () => {
+      const moved = await migrateInboxTasks(oldPath, newPath);
+      notice.hide();
+      new Notice(t('settings.inboxMoved', { n: moved }));
+      this.plugin.reloadOpenViews();
+    });
+    const skip = notice.noticeEl.createEl('button', { text: t('common.cancel') });
+    skip.addEventListener('click', () => notice.hide());
+  }
+}

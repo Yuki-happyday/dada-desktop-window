@@ -1,0 +1,17 @@
+.dada-desktop-window .workspace-leaf-content[data-type="dada-desktop-window-view"] > .view-content {display:flex;flex-direction:column;padding:0;overflow:hidden}
+.workspace-leaf-content[data-type="dada-desktop-window-view"] .dada-todo-root {flex:1;min-height:0}
+.dada-desktop-toolbar {display:flex;gap:6px;align-items:center;padding:8px 10px;border-bottom:1px solid var(--background-modifier-border);flex-shrink:0;background:var(--background-primary);-webkit-app-region:drag!important;user-select:none;touch-action:none}
+.dada-desktop-toolbar strong {-webkit-app-region:drag!important}
+.dada-desktop-toolbar strong {flex:1;font-size:13px}
+.dada-desktop-toolbar button {font-size:12px;padding:4px 8px;-webkit-app-region:no-drag!important;cursor:pointer}
+.dada-desktop-toolbar button * {-webkit-app-region:no-drag!important}
+.dada-desktop-toolbar.is-dragging {cursor:grabbing}
+.dada-desktop-toolbar button.is-active {background:var(--interactive-accent);color:var(--text-on-accent)}
+.dada-desktop-window .workspace-tab-header-container {display:none}
+.dada-desktop-window .titlebar,.dada-desktop-window .titlebar * {-webkit-app-region:drag!important}
+.dada-desktop-window .titlebar {touch-action:none;user-select:none}
+.dada-desktop-window .view-header,.dada-desktop-window .view-header * {-webkit-app-region:drag!important}
+.dada-desktop-window .view-header {touch-action:none;user-select:none}
+.dada-desktop-window :is(.titlebar,.view-header) :is(button,a,input,[role="button"],.clickable-icon,.titlebar-button,.titlebar-button-container,.view-header-nav-buttons,.view-actions),
+.dada-desktop-window :is(.titlebar,.view-header) :is(button,a,input,[role="button"],.clickable-icon,.titlebar-button,.titlebar-button-container,.view-header-nav-buttons,.view-actions) *,
+.dada-desktop-window .modal-container,.dada-desktop-window .modal-container * {-webkit-app-region:no-drag!important}

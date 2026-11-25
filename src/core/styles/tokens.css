@@ -1,0 +1,92 @@
+/* ============================================================
+   设计令牌映射层（移植自 myLife-Plugin 的 App.vue .wb-root）。
+   ------------------------------------------------------------
+   任务模块（TasksApp / tasks-shared.css / task-modal.css）全部使用语义令牌
+   （--gold/--panel/--line/--ink …），这些令牌原由 myLife 的 .wb-root 统一
+   映射到 Obsidian 主题变量。
+
+   本插件直接挂载 TasksApp（无 .wb-root 外壳），故按需把令牌定义到：
+     · .task-app            —— 覆盖应用内所有任务 UI 及子组件；
+     · .mylife-vue-modal    —— Obsidian 原生 Modal 外壳（VueModal 注入），
+                              其下挂载的 TaskEditorModal / 完成日历等弹窗
+                              挂在 <body> 下、不在 .task-app 内，需单独覆盖。
+
+   不污染 :root，避免改掉 Obsidian 原生 UI 的 --shadow-* 等全局令牌。
+   不自行维护颜色：全部跟随 Obsidian 主题变量。卡片一律只用边框区分层级
+   （覆盖阴影令牌，关掉所有投影），贴合原生观感。
+   ============================================================ */
+.task-app,
+.mylife-vue-modal,
+/* 右键菜单挂到 <body>（在 .task-app 之外），需在此声明令牌，否则 var(--paper)/--gold 等解析不到 */
+.tk-ctx {
+  --gold: var(--interactive-accent);
+  --gold-soft: var(--interactive-accent-hover);
+  --gold-bg: var(--background-modifier-hover);
+  /* 今日高亮浅底令牌：周/月视图「今日」格共用，调深浅或换色只改这一处 */
+  --today-tint-color: var(--gold);
+  --today-tint-op: .08;            /* 常规泳道 / 月视图格的浅度 */
+  --today-tint-op-condensed: .16;  /* 全天细窄泳道，.08 几乎看不出，单独加深 */
+  --paper: var(--background-primary);
+  --panel: var(--background-primary);
+  --panel-2: var(--background-secondary);
+  --line: var(--background-modifier-border);
+  --ink: var(--text-normal);
+  --ink-soft: var(--text-muted);
+  --ink-2: var(--text-muted);
+  /* --text-on-accent 不在此自覆盖：Obsidian 原生已在 :root 定义（强调色上的文字色），
+     直接继承即可，避免自引用导致解析失败回退成深色黑字。 */
+  --hover: var(--background-modifier-hover);
+  --shadow: none;
+  --shadow-s: none;
+  --shadow-m: none;
+  --shadow-l: none;
+
+  /* 任务状态 / 节假日徽标统一配色：已办绿、已取消红 */
+  --c-done: #52B434;
+  --c-cancel: #D12C1E;
+
+  /* 已完成 / 已取消任务的统一淡出强度与文字色（issue #16：
+     各视图原为 .45/.55/.6/.75 分散硬编码，现统一引用这两个令牌）。
+     调整淡出深浅只改 --done-opacity 一处即全局生效；文字色统一跟随 --ink-soft。 */
+  --done-color: var(--ink-soft);
+  --done-opacity: .45;
+
+  /* Element Plus 组件跟随主题（任务编辑器沿用原生 input，这里仅做兜底映射） */
+  --el-color-primary: var(--interactive-accent);
+  --el-color-danger: var(--text-error, #e0524b);
+  --el-color-success: var(--text-success, #4ea96b);
+  --el-bg-color: var(--background-primary);
+  --el-bg-color-page: var(--background-primary);
+  --el-fill-color-blank: var(--background-primary);
+  --el-text-color-primary: var(--text-normal);
+  --el-text-color-regular: var(--text-normal);
+  --el-text-color-secondary: var(--text-muted);
+  --el-border-color: var(--background-modifier-border);
+  --el-border-color-light: var(--background-modifier-border);
+  --el-border-color-lighter: var(--background-modifier-border);
+  /* 统一默认圆角（round / circle 仍各自生效） */
+  --el-border-radius-base: 9px;
+}
+
+/* 任务视图根容器：补齐字体。
+   Latin 字体优先（system-ui / -apple-system / Segoe UI / Roboto 等系统 UI 字体对
+   caron/macron 等变音符号定位正确，且观感原生），中文回退到 PingFang / 系统 CJK。
+   原先 CJK 字体置前会导致拉丁变音符号（如 č/š/ž/ć）的附加标记错位到下一字母
+   （与 Obsidian 笔记编辑器表现不一致，见用户报的 diacritics bug）。不引入 Inter
+   （观感差且非必需，system-ui 已足够）。 */
+.task-app {
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+}
+
+/* 时间/日期数字：单独用回改动前的 CJK 优先字体（与 .task-app 的 Latin 优先栈隔离）。
+   时间文本（如 14:30 / 全天 / 10/16）不含变音符号，无错位 bug 风险；单独设定可保持
+   与全局改动前一致的观感，避免被 .task-app 字体栈变化牵连。切勿删除或合并回 .task-app。 */
+.tk-date,
+.tk-tl-time,
+.cel-task-time,
+.tk-ag-time,
+.tk-cl-date {
+  font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+/* 历史配色（皮卡丘 / 紫罗兰）相关的时间文字规则已单独迁出，base 构建不含这些规则。 */
